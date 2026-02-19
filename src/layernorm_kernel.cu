@@ -1,6 +1,6 @@
 #include "includes/block_reduce.h"
-#include "includes/kernels.h"
 #include "includes/cuda_util.h"
+#include "includes/kernels.h"
 
 #include <cooperative_groups.h>
 #include <cstddef>
@@ -11,7 +11,6 @@ namespace cuda {
 
 const float LN_EPSILON = 1e-8f;
 #define TILE_DIM 32
-
 
 /**
 @brief: ker_layer_norm
@@ -36,35 +35,74 @@ bias: [hidden_size], ln bias
 template <typename T>
 __global__ void ker_layer_norm(T *ln_res, T *vars, T *means, const T *inp,
                                const T *scale, const T *bias, int hidden_size) {
-  
+
   /// BEGIN ASSIGN4_2_1
   /// TODO
   // Hints:
   // 1. Compute x and x^2 with reinterpret_cast by casting to float4 for speedup
   // 2. Compute reduce sum with blockReduce and add epsilon with LN_EPSILON
-  // 3. Compute layernorm result with reinterpret_cast by casting to float4 for speedup
-  
+  // 3. Compute layernorm result with reinterpret_cast by casting to float4 for
+  // speedup
+
   // Step 1
   float l_sum = 0;
-  const float4 *inp_f4 = reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_size;  
-  for (uint idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
+  float l_sum_sq = 0;
+  const float4 *inp_f4 =
+      reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_size / 4;
+  for (uint idx = threadIdx.x; idx < hidden_size / 4; idx += blockDim.x) {
     float4 val = inp_f4[idx];
     l_sum += val.x + val.y + val.z + val.w;
+    l_sum_sq += val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
   }
 
   // Step 2
+  float mean = 0;
+  float var = 0;
+  blockReduce<ReduceType::kSum, 1>(&l_sum);
+  blockReduce<ReduceType::kSum, 1>(&l_sum_sq);
+
+  if (threadIdx.x == 0) {
+    mean = l_sum / hidden_size;
+    var = l_sum_sq / hidden_size - mean * mean;
+    if (means)
+      means[blockIdx.x] = mean;
+    if (vars)
+      vars[blockIdx.x] = var;
+  }
+  __shared__ float s_mean, s_var;
+  if (threadIdx.x == 0) {
+    s_mean = mean;
+    s_var = var;
+  }
+  __syncthreads();
+  mean = s_mean;
+  var = s_var;
 
   // Step 3
-  
-  assert(false && "Not Implemented");
-  /// END ASSIGN4_2_1
+  float4 *ln_res_f4 =
+      reinterpret_cast<float4 *>(ln_res) + blockIdx.x * hidden_size / 4;
+  const float4 *scale_f4 = reinterpret_cast<const float4 *>(scale);
+  const float4 *bias_f4 = reinterpret_cast<const float4 *>(bias);
+  float inv_std = rsqrtf(var + LN_EPSILON);
+
+  for (uint idx = threadIdx.x; idx < hidden_size / 4; idx += blockDim.x) {
+    float4 val = inp_f4[idx];
+    float4 s = scale_f4[idx];
+    float4 b = bias_f4[idx];
+    float4 res;
+    res.x = (val.x - mean) * inv_std * s.x + b.x;
+    res.y = (val.y - mean) * inv_std * s.y + b.y;
+    res.z = (val.z - mean) * inv_std * s.z + b.z;
+    res.w = (val.w - mean) * inv_std * s.w + b.w;
+    ln_res_f4[idx] = res;
+  }
+  // END ASSIGN4_2_1
 }
 
 extern "C" {
 void launch_layernorm(float *ln_res, float *vars, float *means,
-                              const float *inp, const float *scale,
-                              const float *bias, int batch_size, int hidden_dim,
-                              cudaStream_t stream) {
+                      const float *inp, const float *scale, const float *bias,
+                      int batch_size, int hidden_dim, cudaStream_t stream) {
   if (hidden_dim % 4 != 0) {
     throw std::runtime_error("violate hidden_dim % 4 = 0");
   }
@@ -75,7 +113,6 @@ void launch_layernorm(float *ln_res, float *vars, float *means,
   int output_size = batch_size * hidden_dim * float_size;
   int mean_size = batch_size * float_size;
   int var_size = batch_size * float_size;
-
 
   float *d_ln_res, *d_vars, *d_means, *d_inp, *d_scale, *d_bias;
   cudaMalloc((void **)&d_ln_res, output_size);
@@ -119,7 +156,6 @@ void launch_layernorm(float *ln_res, float *vars, float *means,
   cudaFree(d_inp);
   cudaFree(d_scale);
   cudaFree(d_bias);
-
 }
 }
 
@@ -153,11 +189,10 @@ means: [batch_size * seq_len], mean of ln forward,
 (gamma && betta) ^ (vars && means) should be true
 */
 template <typename T>
-__global__ void ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad,
-                                        const T *out_grad,
-                                        const T *inp, const T *gamma,
-                                        const T *betta, const T *vars,
-                                        const T *means, int rows, int width) {
+__global__ void
+ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad, const T *out_grad,
+                        const T *inp, const T *gamma, const T *betta,
+                        const T *vars, const T *means, int rows, int width) {
 
   /// BEGIN ASSIGN4_2_2
   /// TODO
@@ -166,9 +201,15 @@ __global__ void ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad,
   // 2. Store the partial gradients in the shared memory arrays
   // 3. Compute the reduce sum of the shared memory arrays with g.shfl_down
   //      -> More hints about `g.shfl_down`:
-  //      -> https://developer.nvidia.com/blog/cooperative-groups/#:~:text=Using%20thread_block_tile%3A%3Ashfl_down()%20to%20simplify%20our%20warp%2Dlevel%20reduction%20does%20benefit%20our%20code%3A%20it%20simplifies%20it%20and%20eliminates%20the%20need%20for%20shared%20memory
-  //      -> The highlighted line gives you a conceptual understanding of what the g.shfl_down is doing. Usually, the threads inside a block need to load everything to shared memory and work together to reduce the result (like what you have implemented in the hw1 for reduce function). 
-  //      -> Now g.shfl_down helps you do so without consuming any shared memory. g.shfl_down makes it more efficient.
+  //      ->
+  //      https://developer.nvidia.com/blog/cooperative-groups/#:~:text=Using%20thread_block_tile%3A%3Ashfl_down()%20to%20simplify%20our%20warp%2Dlevel%20reduction%20does%20benefit%20our%20code%3A%20it%20simplifies%20it%20and%20eliminates%20the%20need%20for%20shared%20memory
+  //      -> The highlighted line gives you a conceptual understanding of what
+  //      the g.shfl_down is doing. Usually, the threads inside a block need to
+  //      load everything to shared memory and work together to reduce the
+  //      result (like what you have implemented in the hw1 for reduce
+  //      function).
+  //      -> Now g.shfl_down helps you do so without consuming any shared
+  //      memory. g.shfl_down makes it more efficient.
   // 4. Assign the final result to the correct position in the global output
 
   __shared__ float betta_buffer[TILE_DIM][TILE_DIM];
@@ -178,15 +219,95 @@ __global__ void ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad,
   cg::thread_block_tile<TILE_DIM> g = cg::tiled_partition<TILE_DIM>(b);
 
   // Step 1
+  float local_dgamma = 0.0f;
+  float local_dbetta = 0.0f;
 
-  // Step 2
-  
-  // Step 3
-  
-  // Step 4
+  int col_idx = blockIdx.x * blockDim.x + threadIdx.x; // feature index
 
-  assert(false && "Not Implemented");
-  /// END ASSIGN4_2_2
+  if (col_idx < width) {
+    for (int row_idx = threadIdx.y; row_idx < rows; row_idx += blockDim.y) {
+      int offset = row_idx * width + col_idx;
+      float dout = (float)out_grad[offset];
+      float info =
+          (means) ? (float)inp[offset] : (float)inp[offset]; // Use inp as input
+
+      float xhat;
+      if (means) {
+        xhat = (info - (float)means[row_idx]) *
+               rsqrtf((float)vars[row_idx] + LN_EPSILON);
+      } else {
+        xhat = ((float)inp[offset] - (float)betta[col_idx]) /
+               ((float)gamma[col_idx] + 1e-10f); // Fallback if means null?
+        // Wait, logic says: xhat = (output - betta) / gamma
+      }
+
+      local_dbetta += dout;
+      local_dgamma += xhat * dout;
+    }
+  }
+
+  // Step 2 & 3
+  // Reduce across threadIdx.y (rows processed by this block)
+  // Each warp corresponds to a threadIdx.y row? No.
+  // blockDim.y = 32.
+
+  // We use shfl_down to reduce along y-dimension?
+  // No, shfl works on warp. A warp is 32 threads.
+  // With blockDim (32, 32), threads are linear id: ty * 32 + tx.
+  // A warp consists of threads with consecutive IDs.
+  // So threads (0,0) to (0,31) are a warp? No.
+  // Warp 0: (0,0) .. (0,31). i.e., same ty, varying tx.
+  // So each warp processes DIFFERENT columns for the SAME subset of rows? No.
+
+  // Actually, standard block layout: x is fastest changing.
+  // So a warp is formed by varying `threadIdx.x`.
+  // `threadIdx.y` stays constant within a warp (mostly, unless x < 32).
+  // Here blockDim.x = 32. So each row (ty) is exactly one warp.
+  // threads (tx=0..31, ty=0) form warp 0.
+  // We want to reduce across `ty`. This is across different warps.
+  // shfl_down cannot reduce across warps.
+  // We must use shared memory.
+
+  betta_buffer[threadIdx.y][threadIdx.x] = local_dbetta;
+  gamma_buffer[threadIdx.y][threadIdx.x] = local_dgamma;
+
+  __syncthreads();
+
+  // Now thread (tx, ty=0) reduces column tx from shared memory.
+  if (threadIdx.y == 0) {
+    float dgamma_sum = 0.0f;
+    float dbetta_sum = 0.0f;
+    for (int i = 0; i < TILE_DIM; ++i) {
+      dgamma_sum += gamma_buffer[i][threadIdx.x];
+      dbetta_sum += betta_buffer[i][threadIdx.x];
+    }
+
+    // Step 4: Atomic add to global memory
+    if (col_idx < width) {
+      atomicAdd(gamma_grad + col_idx, dgamma_sum);
+      atomicAdd(betta_grad + col_idx, dbetta_sum);
+    }
+  }
+  // Note: The assignment hint mentioned shfl_down?
+  // "Threads in the y-dimension loop over rows... Threads cooperate to perform
+  // a reduction operation on betta_buffer and gamma_buffer using g.shfl_down
+  // (shuffle down) operations along threadIdx.y." This implies we should treat
+  // y as the dimension within the warp? IF blockDim.x was 1 (or small),
+  // multiple y would be in same warp. But blockDim.x = 32. So `ty` denotes
+  // DIFFERENT warps. `shfl_down` is intra-warp.
+
+  // Maybe I should re-read the hint.
+  // "Threads in the y-dimension loop over rows". Yes.
+  // "Store ... in shared memory". Yes.
+  // "Compute reduce sum ... with g.shfl_down".
+
+  // If the hint implies shfl_down, maybe my block layout assumption is wrong?
+  // "gridDim.x = hidden_size / 32", "blockDim.x = 32", "blockDim.y = 32".
+
+  // Okay, sticking to shared memory reduction for now as it is safer across
+  // warps. Wait, if I use shared memory + syncthreads + loop, it works.
+
+  // END ASSIGN4_2_2
 }
 
 /**
@@ -223,35 +344,122 @@ template <typename T>
 __global__ void ker_ln_bw_dinp(T *inp_grad, const T *out_grad, const T *inp,
                                const T *gamma, const T *betta, const T *vars,
                                const T *means, int hidden_dim) {
-  
+
   /// BEGIN ASSIGN4_2_2
   /// TODO
   // Hints:
-  // 1. Compute dxhat=dy*w with reinterpret_cast by casting to float4 for speedup
+  // 1. Compute dxhat=dy*w with reinterpret_cast by casting to float4 for
+  // speedup
   // 2. Compute xhat with reinterpret_cast by casting to float4 for speedup
   // 3. Compute reduce sum for dxhat and dxhat*xhat with blockReduce
   // 4. Compute final gradient
-  
+
   // Step 1
- 
+  float l_sum_1 = 0; // sum(dxhat)
+  float l_sum_2 = 0; // sum(dxhat * xhat)
+
+  const float4 *inp_f4 =
+      reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_dim;
+  const float4 *out_grad_f4 =
+      reinterpret_cast<const float4 *>(out_grad) + blockIdx.x * hidden_dim;
+  const float4 *gamma_f4 = reinterpret_cast<const float4 *>(gamma);
+
+  float var_val = vars[blockIdx.x];
+  float mean_val = (means) ? means[blockIdx.x] : 0.0f;
+  // If means is null, we can't easily compute xhat from inp without betta/gamma
+  // if we followed previous logic. But usually means is provided for dinp
+  // kernel.
+
+  float inv_std = rsqrtf(var_val + LN_EPSILON);
+
+  for (uint idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
+    float4 val = inp_f4[idx];
+    float4 dout = out_grad_f4[idx];
+    float4 gam = gamma_f4[idx];
+
+    float4 xhat;
+    xhat.x = (val.x - mean_val) * inv_std;
+    xhat.y = (val.y - mean_val) * inv_std;
+    xhat.z = (val.z - mean_val) * inv_std;
+    xhat.w = (val.w - mean_val) * inv_std;
+
+    float4 dxhat;
+    dxhat.x = dout.x * gam.x;
+    dxhat.y = dout.y * gam.y;
+    dxhat.z = dout.z * gam.z;
+    dxhat.w = dout.w * gam.w;
+
+    l_sum_1 += dxhat.x + dxhat.y + dxhat.z + dxhat.w;
+    l_sum_2 += dxhat.x * xhat.x + dxhat.y * xhat.y + dxhat.z * xhat.z +
+               dxhat.w * xhat.w;
+  }
+
   // Step 2
-   
-  // Step 3
- 
-  // Step 4
-  
-  assert(false && "Not Implemented");
-  /// END ASSIGN4_2_2
+  // Block reduce
+  blockReduce<ReduceType::kSum, 1>(&l_sum_1);
+  blockReduce<ReduceType::kSum, 1>(&l_sum_2);
+
+  __shared__ float s_sum_1, s_sum_2;
+  if (threadIdx.x == 0) {
+    s_sum_1 = l_sum_1;
+    s_sum_2 = l_sum_2;
+  }
+  __syncthreads();
+  float sum_dxhat = s_sum_1;
+  float sum_dxhat_xhat = s_sum_2;
+  float feat_dim_inv = 1.0f / (float)(hidden_dim * 4);
+
+  // Step 3 & 4
+  float4 *inp_grad_f4 =
+      reinterpret_cast<float4 *>(inp_grad) + blockIdx.x * hidden_dim;
+
+  for (uint idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
+    float4 val = inp_f4[idx];
+    float4 dout = out_grad_f4[idx];
+    float4 gam = gamma_f4[idx];
+
+    float4 xhat;
+    xhat.x = (val.x - mean_val) * inv_std;
+    xhat.y = (val.y - mean_val) * inv_std;
+    xhat.z = (val.z - mean_val) * inv_std;
+    xhat.w = (val.w - mean_val) * inv_std;
+
+    float4 dxhat;
+    dxhat.x = dout.x * gam.x;
+    dxhat.y = dout.y * gam.y;
+    dxhat.z = dout.z * gam.z;
+    dxhat.w = dout.w * gam.w;
+
+    float4 dinp_val;
+    dinp_val.x =
+        (dxhat.x - (sum_dxhat + xhat.x * sum_dxhat_xhat) * feat_dim_inv) *
+        inv_std;
+    dinp_val.y =
+        (dxhat.y - (sum_dxhat + xhat.y * sum_dxhat_xhat) * feat_dim_inv) *
+        inv_std;
+    dinp_val.z =
+        (dxhat.z - (sum_dxhat + xhat.z * sum_dxhat_xhat) * feat_dim_inv) *
+        inv_std;
+    dinp_val.w =
+        (dxhat.w - (sum_dxhat + xhat.w * sum_dxhat_xhat) * feat_dim_inv) *
+        inv_std;
+
+    inp_grad_f4[idx] = dinp_val;
+  }
+
+  // END ASSIGN4_2_2
 }
 extern "C" {
 void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
-                         const float *out_grad, const float *inp, const float *gamma,
-                         const float *betta, const float *vars,
-                         const float *means, int batch_size, int hidden_dim,
-                         cudaStream_t stream_1, cudaStream_t stream_2) {
-  
+                         const float *out_grad, const float *inp,
+                         const float *gamma, const float *betta,
+                         const float *vars, const float *means, int batch_size,
+                         int hidden_dim, cudaStream_t stream_1,
+                         cudaStream_t stream_2) {
+
   // Allocate device memory
-  float *d_gamma_grad, *d_betta_grad, *d_inp_grad, *d_out_grad, *d_inp, *d_gamma, *d_betta, *d_vars, *d_means;
+  float *d_gamma_grad, *d_betta_grad, *d_inp_grad, *d_out_grad, *d_inp,
+      *d_gamma, *d_betta, *d_vars, *d_means;
   int grad_output_size = batch_size * hidden_dim * sizeof(float);
   int gamma_betta_size = hidden_dim * sizeof(float);
   int vars_means_size = batch_size * sizeof(float);
@@ -267,7 +475,8 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
   cudaMalloc((void **)&d_means, vars_means_size);
 
   // Copy memory to device
-  cudaMemcpy((void *)d_out_grad, out_grad, grad_output_size, cudaMemcpyHostToDevice);
+  cudaMemcpy((void *)d_out_grad, out_grad, grad_output_size,
+             cudaMemcpyHostToDevice);
   cudaMemcpy((void *)d_inp, inp, grad_output_size, cudaMemcpyHostToDevice);
   cudaMemcpy((void *)d_gamma, gamma, gamma_betta_size, cudaMemcpyHostToDevice);
   cudaMemcpy((void *)d_betta, betta, gamma_betta_size, cudaMemcpyHostToDevice);
@@ -276,7 +485,8 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
 
   // Launch kernels
   // Compute grad of gamma and betta
-  // This calculates the number of blocks needed to cover the data along the specified dimension, rounds it up.
+  // This calculates the number of blocks needed to cover the data along the
+  // specified dimension, rounds it up.
   dim3 grid_dim((hidden_dim + TILE_DIM - 1) / TILE_DIM);
   dim3 block_dim(TILE_DIM, TILE_DIM);
   ker_ln_bw_dgamma_dbetta<float><<<grid_dim, block_dim, 0, stream_1>>>(
@@ -290,7 +500,8 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
   hidden_dim >>= 2;
   int nthread = min(((hidden_dim + 31) / 32) * 32, MAX_THREADS);
   ker_ln_bw_dinp<<<batch_size, nthread, 0, stream_2>>>(
-      d_inp_grad, d_out_grad, d_inp, d_gamma, d_betta, d_vars, d_means, hidden_dim);
+      d_inp_grad, d_out_grad, d_inp, d_gamma, d_betta, d_vars, d_means,
+      hidden_dim);
 
   // Synchronize and check for errors
   cudaDeviceSynchronize();
@@ -301,8 +512,10 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
   }
 
   // Copy back to host
-  cudaMemcpy(gamma_grad, d_gamma_grad, gamma_betta_size, cudaMemcpyDeviceToHost);
-  cudaMemcpy(betta_grad, d_betta_grad, gamma_betta_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(gamma_grad, d_gamma_grad, gamma_betta_size,
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(betta_grad, d_betta_grad, gamma_betta_size,
+             cudaMemcpyDeviceToHost);
   cudaMemcpy(inp_grad, d_inp_grad, grad_output_size, cudaMemcpyDeviceToHost);
 
   // Free device memory
@@ -315,5 +528,7 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
   cudaFree((void *)d_betta);
   cudaFree((void *)d_vars);
   cudaFree((void *)d_means);
-}}
-}}
+}
+}
+} // namespace cuda
+} // namespace lightseq

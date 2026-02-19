@@ -209,8 +209,7 @@ def GELU(input: Tensor) -> Tensor:
     """Applies the GELU activation function with 'tanh' approximation element-wise
     https://pytorch.org/docs/stable/generated/torch.nn.GELU.html
     """
-    # COPY FROM ASSIGN2_2
-    raise NotImplementedError
+    return 0.5 * input * (1 + (np.sqrt(2 / math.pi) * (input + 0.044715 * (input ** 3))).tanh())
 
 
 def logsumexp(input: Tensor, dim: int) -> Tensor:
@@ -225,8 +224,17 @@ def logsumexp(input: Tensor, dim: int) -> Tensor:
         out : The output tensor with the same number of dimensions as input (equiv. to keepdims=True)
             NOTE: minitorch functions/tensor functions typically keep dimensions if you provide a dimensions.
     """  
-    # COPY FROM ASSIGN2_2
-    raise NotImplementedError
+    ### BEGIN ASSIGN3_1
+    max_val = Max.apply(input, tensor([dim]))
+    input_shape = input.shape
+    view_shape = list(input_shape)
+    view_shape[dim] = 1
+    max_val_view = max_val.view(*view_shape)
+    stable_exp = (input - max_val_view).exp()
+    sum_exp = stable_exp.sum(dim)
+    sum_exp_view = sum_exp.view(*view_shape)
+    return sum_exp_view.log() + max_val_view
+    ### END ASSIGN3_1
 
 
 def one_hot(input: Tensor, num_classes: int) -> Tensor:
@@ -236,8 +244,10 @@ def one_hot(input: Tensor, num_classes: int) -> Tensor:
 
     Hint: You may want to use a combination of np.eye, tensor_from_numpy, 
     """
-    # COPY FROM ASSIGN2_2
-    raise NotImplementedError
+    return tensor_from_numpy(
+                np.eye(num_classes)[input.to_numpy().astype(int)], 
+                backend=input.backend
+            )
 
 
 def softmax_loss(logits: Tensor, target: Tensor) -> Tensor:
@@ -253,7 +263,12 @@ def softmax_loss(logits: Tensor, target: Tensor) -> Tensor:
     """
     result = None
     
-    # COPY FROM ASSIGN2_2
-    raise NotImplementedError
+    batch_size = logits.shape[0]
+    ### BEGIN ASSIGN3_1
+    lse = logsumexp(logits, 1)
+    target_logits = (logits * one_hot(target, logits.shape[1])).sum(1)
+    target_logits = target_logits.view(batch_size, 1)
+    result = lse - target_logits
+    ### END ASSIGN3_1
     
     return result.view(batch_size, )
