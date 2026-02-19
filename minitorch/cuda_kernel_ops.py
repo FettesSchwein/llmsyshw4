@@ -420,12 +420,12 @@ class CudaKernelOps(TensorOps):
       ]
       lib_softmax.launch_attn_softmax_bw.restype = None
 
-      batch_size, nhead, seq_len, _ = out_grad.shape
+      batch_size, nhead, from_len, to_len = out_grad.shape
       lib_softmax.launch_attn_softmax_bw(
           out_grad._tensor._storage,
           soft_inp._tensor._storage,
-          batch_size * nhead * seq_len,
-          seq_len,
+          batch_size * nhead * from_len,
+          to_len,
           stream
       )
       return out_grad
@@ -434,7 +434,8 @@ class CudaKernelOps(TensorOps):
     @staticmethod
     def layernorm_fw(inp: Tensor, gamma: Tensor, beta: Tensor):
       #   BEGIN ASSIGN4_2_1
-      batch_size, seq_len, hidden_dim = inp.shape
+      hidden_dim = inp.shape[-1]
+      rows = int(np.prod(inp.shape[:-1]))
       stream = torch.cuda.current_stream().cuda_stream
       
       lib_layernorm.launch_layernorm.argtypes = [
@@ -451,8 +452,8 @@ class CudaKernelOps(TensorOps):
       lib_layernorm.launch_layernorm.restype = None
       
       output = inp.zeros(inp.shape)
-      means = inp.zeros((batch_size, seq_len))
-      vars = inp.zeros((batch_size, seq_len))
+      means = inp.zeros(inp.shape[:-1])
+      vars = inp.zeros(inp.shape[:-1])
       
       lib_layernorm.launch_layernorm(
           output._tensor._storage,
@@ -461,7 +462,7 @@ class CudaKernelOps(TensorOps):
           inp._tensor._storage,
           gamma._tensor._storage,
           beta._tensor._storage,
-          batch_size * seq_len,
+          rows,
           hidden_dim,
           stream
       )
@@ -471,7 +472,8 @@ class CudaKernelOps(TensorOps):
     @staticmethod
     def layernorm_bw(out_grad: Tensor, inp: Tensor, gamma: Tensor, beta: Tensor, var: Tensor, mean: Tensor):
       #   BEGIN ASSIGN4_2_2
-      batch_size, seq_len, hidden_dim = out_grad.shape
+      hidden_dim = out_grad.shape[-1]
+      rows = int(np.prod(out_grad.shape[:-1]))
       stream = torch.cuda.current_stream().cuda_stream
       
       lib_layernorm.launch_layernorm_bw.argtypes = [
