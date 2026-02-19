@@ -390,7 +390,8 @@ void launch_attn_softmax_bw(float *out_grad, const float *soft_outp, int rows,
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
-    fprintf(stderr, "launch_attn_softmax_bw Error: %s\n", cudaGetErrorString(err));
+    fprintf(stderr, "launch_attn_softmax_bw Error: %s\n",
+            cudaGetErrorString(err));
     exit(EXIT_FAILURE);
   }
 
@@ -399,5 +400,5 @@ void launch_attn_softmax_bw(float *out_grad, const float *soft_outp, int rows,
   // END ASSIGN4_1_2
 }
 }
-
-}
+} // namespace cuda
+} // namespace lightseq
