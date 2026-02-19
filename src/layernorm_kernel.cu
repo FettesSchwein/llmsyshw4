@@ -212,24 +212,19 @@ ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad, const T *out_grad,
   //      memory. g.shfl_down makes it more efficient.
   // 4. Assign the final result to the correct position in the global output
 
-  __shared__ float betta_buffer[TILE_DIM][TILE_DIM];
-  __shared__ float gamma_buffer[TILE_DIM][TILE_DIM];
-
   cg::thread_block b = cg::this_thread_block();
-  cg::thread_block_tile<TILE_DIM> g = cg::tiled_partition<TILE_DIM>(b);
+  cg::thread_block_tile<32> g = cg::tiled_partition<32>(b);
 
-  // Step 1
   float local_dgamma = 0.0f;
   float local_dbetta = 0.0f;
 
-  int col_idx = blockIdx.x * blockDim.x + threadIdx.x; // feature index
+  int col_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (col_idx < width) {
     for (int row_idx = threadIdx.y; row_idx < rows; row_idx += blockDim.y) {
       int offset = row_idx * width + col_idx;
       float dout = (float)out_grad[offset];
-      float info =
-          (means) ? (float)inp[offset] : (float)inp[offset]; // Use inp as input
+      float info = (means) ? (float)inp[offset] : (float)inp[offset];
 
       float xhat;
       if (means) {
@@ -237,8 +232,7 @@ ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad, const T *out_grad,
                rsqrtf((float)vars[row_idx] + LN_EPSILON);
       } else {
         xhat = ((float)inp[offset] - (float)betta[col_idx]) /
-               ((float)gamma[col_idx] + 1e-10f); // Fallback if means null?
-        // Wait, logic says: xhat = (output - betta) / gamma
+               ((float)gamma[col_idx] + LN_EPSILON);
       }
 
       local_dbetta += dout;
@@ -246,67 +240,15 @@ ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad, const T *out_grad,
     }
   }
 
-  // Step 2 & 3
-  // Reduce across threadIdx.y (rows processed by this block)
-  // Each warp corresponds to a threadIdx.y row? No.
-  // blockDim.y = 32.
-
-  // We use shfl_down to reduce along y-dimension?
-  // No, shfl works on warp. A warp is 32 threads.
-  // With blockDim (32, 32), threads are linear id: ty * 32 + tx.
-  // A warp consists of threads with consecutive IDs.
-  // So threads (0,0) to (0,31) are a warp? No.
-  // Warp 0: (0,0) .. (0,31). i.e., same ty, varying tx.
-  // So each warp processes DIFFERENT columns for the SAME subset of rows? No.
-
-  // Actually, standard block layout: x is fastest changing.
-  // So a warp is formed by varying `threadIdx.x`.
-  // `threadIdx.y` stays constant within a warp (mostly, unless x < 32).
-  // Here blockDim.x = 32. So each row (ty) is exactly one warp.
-  // threads (tx=0..31, ty=0) form warp 0.
-  // We want to reduce across `ty`. This is across different warps.
-  // shfl_down cannot reduce across warps.
-  // We must use shared memory.
-
-  betta_buffer[threadIdx.y][threadIdx.x] = local_dbetta;
-  gamma_buffer[threadIdx.y][threadIdx.x] = local_dgamma;
-
-  __syncthreads();
-
-  // Now thread (tx, ty=0) reduces column tx from shared memory.
-  if (threadIdx.y == 0) {
-    float dgamma_sum = 0.0f;
-    float dbetta_sum = 0.0f;
-    for (int i = 0; i < TILE_DIM; ++i) {
-      dgamma_sum += gamma_buffer[i][threadIdx.x];
-      dbetta_sum += betta_buffer[i][threadIdx.x];
-    }
-
-    // Step 4: Atomic add to global memory
-    if (col_idx < width) {
-      atomicAdd(gamma_grad + col_idx, dgamma_sum);
-      atomicAdd(betta_grad + col_idx, dbetta_sum);
-    }
+  for (int offset = 16; offset > 0; offset /= 2) {
+    local_dbetta += g.shfl_down(local_dbetta, offset);
+    local_dgamma += g.shfl_down(local_dgamma, offset);
   }
-  // Note: The assignment hint mentioned shfl_down?
-  // "Threads in the y-dimension loop over rows... Threads cooperate to perform
-  // a reduction operation on betta_buffer and gamma_buffer using g.shfl_down
-  // (shuffle down) operations along threadIdx.y." This implies we should treat
-  // y as the dimension within the warp? IF blockDim.x was 1 (or small),
-  // multiple y would be in same warp. But blockDim.x = 32. So `ty` denotes
-  // DIFFERENT warps. `shfl_down` is intra-warp.
 
-  // Maybe I should re-read the hint.
-  // "Threads in the y-dimension loop over rows". Yes.
-  // "Store ... in shared memory". Yes.
-  // "Compute reduce sum ... with g.shfl_down".
-
-  // If the hint implies shfl_down, maybe my block layout assumption is wrong?
-  // "gridDim.x = hidden_size / 32", "blockDim.x = 32", "blockDim.y = 32".
-
-  // Okay, sticking to shared memory reduction for now as it is safer across
-  // warps. Wait, if I use shared memory + syncthreads + loop, it works.
-
+  if (threadIdx.y == 0 && col_idx < width) {
+    atomicAdd(gamma_grad + col_idx, local_dgamma);
+    atomicAdd(betta_grad + col_idx, local_dbetta);
+  }
   // END ASSIGN4_2_2
 }
 
@@ -354,97 +296,74 @@ __global__ void ker_ln_bw_dinp(T *inp_grad, const T *out_grad, const T *inp,
   // 3. Compute reduce sum for dxhat and dxhat*xhat with blockReduce
   // 4. Compute final gradient
 
-  // Step 1
   float l_sum_1 = 0; // sum(dxhat)
   float l_sum_2 = 0; // sum(dxhat * xhat)
 
-  const float4 *inp_f4 =
-      reinterpret_cast<const float4 *>(inp) + blockIdx.x * hidden_dim;
-  const float4 *out_grad_f4 =
-      reinterpret_cast<const float4 *>(out_grad) + blockIdx.x * hidden_dim;
-  const float4 *gamma_f4 = reinterpret_cast<const float4 *>(gamma);
-
-  float var_val = vars[blockIdx.x];
-  float mean_val = (means) ? means[blockIdx.x] : 0.0f;
-  // If means is null, we can't easily compute xhat from inp without betta/gamma
-  // if we followed previous logic. But usually means is provided for dinp
-  // kernel.
-
+  int row_idx = blockIdx.x;
+  float var_val = vars[row_idx];
+  float mean_val = (means) ? means[row_idx] : 0.0f;
   float inv_std = rsqrtf(var_val + LN_EPSILON);
 
-  for (uint idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
-    float4 val = inp_f4[idx];
-    float4 dout = out_grad_f4[idx];
-    float4 gam = gamma_f4[idx];
+  // Calculate local sums
+  for (int col_idx = threadIdx.x; col_idx < hidden_dim; col_idx += blockDim.x) {
+    int offset = row_idx * hidden_dim + col_idx;
+    float val = (float)inp[offset];
+    float dout = (float)out_grad[offset];
+    float gam = (float)gamma[col_idx];
+    float bet = (betta) ? (float)betta[col_idx] : 0.0f;
 
-    float4 xhat;
-    xhat.x = (val.x - mean_val) * inv_std;
-    xhat.y = (val.y - mean_val) * inv_std;
-    xhat.z = (val.z - mean_val) * inv_std;
-    xhat.w = (val.w - mean_val) * inv_std;
+    float xhat;
+    if (means) {
+      xhat = (val - mean_val) * inv_std;
+    } else {
+      xhat = (val - bet) / (gam + LN_EPSILON);
+    }
 
-    float4 dxhat;
-    dxhat.x = dout.x * gam.x;
-    dxhat.y = dout.y * gam.y;
-    dxhat.z = dout.z * gam.z;
-    dxhat.w = dout.w * gam.w;
-
-    l_sum_1 += dxhat.x + dxhat.y + dxhat.z + dxhat.w;
-    l_sum_2 += dxhat.x * xhat.x + dxhat.y * xhat.y + dxhat.z * xhat.z +
-               dxhat.w * xhat.w;
+    float dxhat = dout * gam;
+    l_sum_1 += dxhat;
+    l_sum_2 += dxhat * xhat;
   }
 
-  // Step 2
-  // Block reduce
-  blockReduce<ReduceType::kSum, 1>(&l_sum_1);
-  blockReduce<ReduceType::kSum, 1>(&l_sum_2);
+  // Block reduce sums using shared memory reduction
+  extern __shared__ float s_mem[];
+  float *s_sum_1 = s_mem;
+  float *s_sum_2 = &s_mem[blockDim.x];
 
-  __shared__ float s_sum_1, s_sum_2;
-  if (threadIdx.x == 0) {
-    s_sum_1 = l_sum_1;
-    s_sum_2 = l_sum_2;
-  }
+  s_sum_1[threadIdx.x] = l_sum_1;
+  s_sum_2[threadIdx.x] = l_sum_2;
   __syncthreads();
-  float sum_dxhat = s_sum_1;
-  float sum_dxhat_xhat = s_sum_2;
-  float feat_dim_inv = 1.0f / (float)(hidden_dim * 4);
 
-  // Step 3 & 4
-  float4 *inp_grad_f4 =
-      reinterpret_cast<float4 *>(inp_grad) + blockIdx.x * hidden_dim;
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      s_sum_1[threadIdx.x] += s_sum_1[threadIdx.x + stride];
+      s_sum_2[threadIdx.x] += s_sum_2[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
 
-  for (uint idx = threadIdx.x; idx < hidden_dim; idx += blockDim.x) {
-    float4 val = inp_f4[idx];
-    float4 dout = out_grad_f4[idx];
-    float4 gam = gamma_f4[idx];
+  float sum_dxhat = s_sum_1[0];
+  float sum_dxhat_xhat = s_sum_2[0];
+  float feat_dim_inv = 1.0f / (float)(hidden_dim);
 
-    float4 xhat;
-    xhat.x = (val.x - mean_val) * inv_std;
-    xhat.y = (val.y - mean_val) * inv_std;
-    xhat.z = (val.z - mean_val) * inv_std;
-    xhat.w = (val.w - mean_val) * inv_std;
+  // Calculate and assign final gradient
+  for (int col_idx = threadIdx.x; col_idx < hidden_dim; col_idx += blockDim.x) {
+    int offset = row_idx * hidden_dim + col_idx;
+    float val = (float)inp[offset];
+    float dout = (float)out_grad[offset];
+    float gam = (float)gamma[col_idx];
+    float bet = (betta) ? (float)betta[col_idx] : 0.0f;
 
-    float4 dxhat;
-    dxhat.x = dout.x * gam.x;
-    dxhat.y = dout.y * gam.y;
-    dxhat.z = dout.z * gam.z;
-    dxhat.w = dout.w * gam.w;
+    float xhat;
+    if (means) {
+      xhat = (val - mean_val) * inv_std;
+    } else {
+      xhat = (val - bet) / (gam + LN_EPSILON);
+    }
 
-    float4 dinp_val;
-    dinp_val.x =
-        (dxhat.x - (sum_dxhat + xhat.x * sum_dxhat_xhat) * feat_dim_inv) *
-        inv_std;
-    dinp_val.y =
-        (dxhat.y - (sum_dxhat + xhat.y * sum_dxhat_xhat) * feat_dim_inv) *
-        inv_std;
-    dinp_val.z =
-        (dxhat.z - (sum_dxhat + xhat.z * sum_dxhat_xhat) * feat_dim_inv) *
-        inv_std;
-    dinp_val.w =
-        (dxhat.w - (sum_dxhat + xhat.w * sum_dxhat_xhat) * feat_dim_inv) *
-        inv_std;
-
-    inp_grad_f4[idx] = dinp_val;
+    float dxhat = dout * gam;
+    float dinp_val =
+        (dxhat - (sum_dxhat + xhat * sum_dxhat_xhat) * feat_dim_inv) * inv_std;
+    inp_grad[offset] = (T)dinp_val;
   }
 
   // END ASSIGN4_2_2
@@ -493,13 +412,12 @@ void launch_layernorm_bw(float *gamma_grad, float *betta_grad, float *inp_grad,
       d_gamma_grad, d_betta_grad, d_out_grad, d_inp, d_gamma, d_betta, d_vars,
       d_means, batch_size, hidden_dim);
 
-  // Compute grad of input
-  if (hidden_dim % 4 != 0 || hidden_dim > 4096) {
-    throw std::runtime_error("hidden_dim % 4 != 0 || hidden_dim > 4096");
+  if (hidden_dim > 4096) {
+    throw std::runtime_error("hidden_dim > 4096");
   }
-  hidden_dim >>= 2;
   int nthread = min(((hidden_dim + 31) / 32) * 32, MAX_THREADS);
-  ker_ln_bw_dinp<<<batch_size, nthread, 0, stream_2>>>(
+  int shared_mem_size = 2 * nthread * sizeof(float);
+  ker_ln_bw_dinp<<<batch_size, nthread, shared_mem_size, stream_2>>>(
       d_inp_grad, d_out_grad, d_inp, d_gamma, d_betta, d_vars, d_means,
       hidden_dim);
 

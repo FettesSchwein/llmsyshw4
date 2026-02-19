@@ -324,8 +324,11 @@ __global__ void ker_attn_softmax_bw(T *grad, const T *inp, int rows,
   cg::thread_block b = cg::this_thread_block();
   cg::thread_block_tile<WARP_SIZE> g = cg::tiled_partition<WARP_SIZE>(b);
 
-  for (int i = 1; i < WARP_SIZE; i <<= 1)
-    sum += g.shfl_xor(sum, i);
+  for (int i = 16; i > 0; i /= 2)
+    sum += g.shfl_down(sum, i);
+
+  // Broadcast the sum to all threads in the warp
+  sum = g.shfl(sum, 0);
 
 #pragma unroll
   for (int i = 0; i < ITERATIONS; ++i) {
