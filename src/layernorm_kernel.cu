@@ -212,23 +212,25 @@ ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad, const T *out_grad,
   //      memory. g.shfl_down makes it more efficient.
   // 4. Assign the final result to the correct position in the global output
 
+  __shared__ float gamma_buffer[TILE_DIM][TILE_DIM];
+  __shared__ float betta_buffer[TILE_DIM][TILE_DIM];
+
   cg::thread_block b = cg::this_thread_block();
-  cg::thread_block_tile<32> g = cg::tiled_partition<32>(b);
+  cg::thread_block_tile<TILE_DIM> g = cg::tiled_partition<TILE_DIM>(b);
 
   float local_dgamma = 0.0f;
   float local_dbetta = 0.0f;
 
-  int col_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int col_idx = blockIdx.x * TILE_DIM + threadIdx.x;
 
   if (col_idx < width) {
     for (int row_idx = threadIdx.y; row_idx < rows; row_idx += blockDim.y) {
       int offset = row_idx * width + col_idx;
       float dout = (float)out_grad[offset];
-      float info = (means) ? (float)inp[offset] : (float)inp[offset];
 
       float xhat;
       if (means) {
-        xhat = (info - (float)means[row_idx]) *
+        xhat = ((float)inp[offset] - (float)means[row_idx]) *
                rsqrtf((float)vars[row_idx] + LN_EPSILON);
       } else {
         xhat = ((float)inp[offset] - (float)betta[col_idx]) /
@@ -240,14 +242,27 @@ ker_ln_bw_dgamma_dbetta(T *gamma_grad, T *betta_grad, const T *out_grad,
     }
   }
 
+  // Store partial sums in shared memory
+  gamma_buffer[threadIdx.y][threadIdx.x] = local_dgamma;
+  betta_buffer[threadIdx.y][threadIdx.x] = local_dbetta;
+  __syncthreads();
+
+  // Transpose read: now shfl_down reduces across the original y dimension
+  float sum_dgamma = gamma_buffer[threadIdx.x][threadIdx.y];
+  float sum_dbetta = betta_buffer[threadIdx.x][threadIdx.y];
+
   for (int offset = 16; offset > 0; offset /= 2) {
-    local_dbetta += g.shfl_down(local_dbetta, offset);
-    local_dgamma += g.shfl_down(local_dgamma, offset);
+    sum_dgamma += g.shfl_down(sum_dgamma, offset);
+    sum_dbetta += g.shfl_down(sum_dbetta, offset);
   }
 
-  if (threadIdx.y == 0 && col_idx < width) {
-    atomicAdd(gamma_grad + col_idx, local_dgamma);
-    atomicAdd(betta_grad + col_idx, local_dbetta);
+  // threadIdx.x == 0 has the final sum; column is now indexed by threadIdx.y
+  if (threadIdx.x == 0) {
+    int final_col = blockIdx.x * TILE_DIM + threadIdx.y;
+    if (final_col < width) {
+      gamma_grad[final_col] = sum_dgamma;
+      betta_grad[final_col] = sum_dbetta;
+    }
   }
   // END ASSIGN4_2_2
 }
