@@ -379,18 +379,17 @@ class Attn_Softmax(Function):
     @staticmethod
     def forward(ctx: Context, inp: Tensor, mask: Tensor) -> Tensor:
       #   BEGIN ASSIGN4_1_1
-      ctx.save_for_backward(mask)
-      return inp.f.attn_softmax_fw(inp, mask)
+      soft_out = inp.f.attn_softmax_fw(inp, mask)
+      ctx.save_for_backward(soft_out)
+      return soft_out
       #   END ASSIGN4_1_1
 
     @staticmethod
     def backward(ctx: Context, out_grad: Tensor) -> Tensor:
       #   BEGIN ASSIGN4_1_2
-      #   BEGIN ASSIGN4_1_2
-      mask, = ctx.saved_values
-      grad_inp = out_grad.f.attn_softmax_bw(out_grad, mask)
+      soft_out, = ctx.saved_values
+      grad_inp = out_grad.f.attn_softmax_bw(out_grad, soft_out)
       return grad_inp, 0.0
-      #   END ASSIGN4_1_2
       #   END ASSIGN4_1_2
 
 

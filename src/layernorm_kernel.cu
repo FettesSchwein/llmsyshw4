@@ -127,8 +127,8 @@ void launch_layernorm(float *ln_res, float *vars, float *means,
   cudaMemcpy(d_bias, bias, bias_size, cudaMemcpyHostToDevice);
 
   // For using float4
-  hidden_dim >>= 2;
-  int nthread = min(((hidden_dim + 31) / 32) * 32, MAX_THREADS);
+  int hidden_dim_f4 = hidden_dim >> 2;
+  int nthread = min(((hidden_dim_f4 + 31) / 32) * 32, MAX_THREADS);
   dim3 grid_dim(batch_size);
   dim3 block_dim(nthread);
 

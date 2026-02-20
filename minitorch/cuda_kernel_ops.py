@@ -506,7 +506,7 @@ class CudaKernelOps(TensorOps):
           beta._tensor._storage,
           var._tensor._storage,
           mean._tensor._storage,
-          batch_size * seq_len,
+          rows,
           hidden_dim,
           stream,
           stream
