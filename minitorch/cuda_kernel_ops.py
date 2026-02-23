@@ -378,9 +378,15 @@ class CudaKernelOps(TensorOps):
 
     @staticmethod
     def attn_softmax_fw(inp: Tensor, mask: Tensor):
+      inp = inp.contiguous()
       batch_size, nhead, from_len, to_len = inp.shape
-      is_dec_self_attn = False
+      # The CUDA kernel expects mask shape [batch_size, to_len], not [bs, nh, seq, seq].
+      # For causal (dec-self-attn) use is_dec_self_attn=True which activates
+      # mask_future internally. Pass a zero mask of the correct size.
+      is_dec_self_attn = True
       stream = torch.cuda.current_stream().cuda_stream
+
+      zero_mask = inp.zeros((batch_size, to_len))
 
       lib_softmax.launch_attn_softmax.argtypes = [
         np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
@@ -396,7 +402,7 @@ class CudaKernelOps(TensorOps):
 
       lib_softmax.launch_attn_softmax(
         inp._tensor._storage,
-        mask._tensor._storage,
+        zero_mask._tensor._storage,
         batch_size,
         nhead,
         from_len,
