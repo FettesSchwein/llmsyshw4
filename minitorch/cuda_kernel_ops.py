@@ -434,6 +434,9 @@ class CudaKernelOps(TensorOps):
     @staticmethod
     def layernorm_fw(inp: Tensor, gamma: Tensor, beta: Tensor):
       #   BEGIN ASSIGN4_2_1
+      inp = inp.contiguous()
+      gamma = gamma.contiguous()
+      beta = beta.contiguous()
       hidden_dim = inp.shape[-1]
       rows = int(np.prod(inp.shape[:-1]))
       stream = torch.cuda.current_stream().cuda_stream
@@ -472,6 +475,12 @@ class CudaKernelOps(TensorOps):
     @staticmethod
     def layernorm_bw(out_grad: Tensor, inp: Tensor, gamma: Tensor, beta: Tensor, var: Tensor, mean: Tensor):
       #   BEGIN ASSIGN4_2_2
+      out_grad = out_grad.contiguous()
+      inp = inp.contiguous()
+      gamma = gamma.contiguous()
+      beta = beta.contiguous()
+      var = var.contiguous()
+      mean = mean.contiguous()
       hidden_dim = out_grad.shape[-1]
       rows = int(np.prod(out_grad.shape[:-1]))
       stream = torch.cuda.current_stream().cuda_stream
