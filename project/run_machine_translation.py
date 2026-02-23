@@ -7,8 +7,6 @@ import json
 import random
 import datasets
 import numpy as np
-import argparse
-from distutils.util import strtobool
 
 from sacrebleu.metrics import BLEU
 from transformers import AutoTokenizer
@@ -211,25 +209,17 @@ def train(model, optimizer, examples, n_samples, collate_fn, batch_size, desc):
             lr=optimizer.lr)
 
 
-def parse_args():
-    def str2bool(x):
-        return bool(strtobool(x))
-        
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--use-fused-kernel', type=str2bool, default=False)
-    return parser.parse_args()
-
-
 def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
          model_max_length=40,
          n_epochs=1,
          batch_size=128,
-         learning_rate=0.02,
+         learning_rate=0.002,
          samples_per_epoch=20000,
          n_vocab=10000,
          n_embd=256,
-         seed=11111):
-    args = parse_args()
+         seed=11111,
+         use_fused_kernel=False):
+    use_fused_kernel = bool(use_fused_kernel)
              
     np.random.seed(seed)
     random.seed(seed)
@@ -248,7 +238,7 @@ def main(dataset_name='bbaaaa/iwslt14-de-en-preprocess',
         'p_dropout'   : 0.1,  # x_pdrop
         'ln_eps'      : 1e-5, # layer_norm_epsilon
         'backend'     : backend,
-        'use_fused_kernel': args.use_fused_kernel
+        'use_fused_kernel': use_fused_kernel
     }
 
     model = DecoderLM(**config)
