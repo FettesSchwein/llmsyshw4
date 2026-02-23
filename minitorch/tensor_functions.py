@@ -135,6 +135,7 @@ class PowerScalar(Function):
             output : Tensor
                 Tensor containing the result of raising every element of a to scalar.
         """
+        ctx.save_for_backward(a, scalar)
         return a.f.pow_scalar_zip(a, scalar)
 
     @staticmethod
@@ -200,7 +201,7 @@ class Tanh(Function):
                 gradient_for_a must be the correct element-wise gradient for tanh.
         """
         (out,) = ctx.saved_values
-        return grad_output * (1.0 - out * out)
+        return grad_output * (-out * out + 1.0)
 
 
 class Sigmoid(Function):
