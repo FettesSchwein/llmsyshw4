@@ -53,6 +53,7 @@ class MultiHeadAttention(Module):
         self.v_projection = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.out_projection = Linear(n_embd, n_embd, bias=bias, backend=backend)
         self.dropout = Dropout(p_dropout)
+        self.use_fused_kernel = use_fused_kernel
 
     def create_causal_mask(self, bs, nh, seq_len):
         """
