@@ -23,12 +23,10 @@ cd $WORKDIR
 source .venv/bin/activate
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
-# Ensure minitorch is installed in the active venv
-python3 -m pip install -e . -q
+
 
 echo "Python $(python3 --version)"
 echo "nvcc: $(nvcc --version | tail -1)"
-python3 -m pip show minitorch 2>/dev/null | grep -E 'Name|Version|Location' || true
 
 # Compile CUDA kernels (will fail early if nvcc is not available)
 bash compile_cuda.sh
