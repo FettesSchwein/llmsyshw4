@@ -22,7 +22,7 @@ cd $WORKDIR
 
 echo "Python $($PYTHON --version)"
 echo "nvcc: $(nvcc --version | tail -1)"
-$PYTHON -m pip show minitorch 2>/dev/null | grep -E 'Name|Version|Location'
+$PYTHON -m pip show minitorch 2>/dev/null | grep -E 'Name|Version|Location' || true
 
 # Compile CUDA kernels (will fail early if nvcc is not available)
 bash compile_cuda.sh
