@@ -59,6 +59,8 @@ __global__ void ker_layer_norm(T *ln_res, T *vars, T *means, const T *inp,
   float mean = 0;
   float var = 0;
   blockReduce<ReduceType::kSum, 1>(&l_sum);
+  __syncthreads(); // must sync before reusing shared memory in second
+                   // blockReduce
   blockReduce<ReduceType::kSum, 1>(&l_sum_sq);
 
   if (threadIdx.x == 0) {
