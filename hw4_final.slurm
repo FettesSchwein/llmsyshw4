@@ -3,7 +3,7 @@
 #SBATCH --partition=GPU-shared
 #SBATCH --nodes=1
 #SBATCH --gpus=v100-32:1
-#SBATCH --time=3:00:00
+#SBATCH --time=2:00:00
 #SBATCH --output=/jet/home/rnagaraj/mt_output_%j.log
 #SBATCH --error=/jet/home/rnagaraj/mt_error_%j.log
 #SBATCH -A cis250019p
